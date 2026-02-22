@@ -13,17 +13,23 @@ Transform arXiv papers into production-ready projects using a multi-agent workfl
 
 ---
 
-##Table of Contents
+# Table of Contents
 
-- [What It Does](#-what-it-does)
-- [Generated Project Example](#-generated-project-example)
-- [Features](#-features)
+- [What It Does](#what-it-does)
+- [Generated Project Example](#generated-project-example)
+- [Features](#features)
 - [Quick Start](#-quick-start)
-- [Usage Flow](#-usage-flow)
-- [Configuration](#-configuration)
-- [Development & Debugging](#-development--debugging)
-- [License](#-license)
-- [Acknowledgments](#-acknowledgments)
+  - [1. Clone & Install](#1-clone--install)
+  - [2. Configure LLM](#2-configure-llm)
+  - [3. Run](#3-run)
+- [Usage Flow](#usage-flow)
+  - [Agent Roles](#agent-roles)
+  - [Key Design Decisions](#key-design-decisions)
+- [Project Structure](#project-structure)
+- [Performance](#performance)
+- [Contributing](#contributing)
+- [License](#license)
+- [Acknowledgments](#acknowledgments)
 
 ---
 
@@ -42,7 +48,7 @@ This pipeline does it automatically:
 ---
 ## Generated Project Example
 
-For **"Attention Is All You Need"** paper:
+For **"Attention Is All You Need"** paper (arXiv:1706.03762):
 
 ```
 output/projects/transformer-attention/
@@ -159,7 +165,7 @@ streamlit run app.py
 └── screenshots/           # UI screenshots
 ```
 
-##Performance
+## Performance
 
 | Paper | Files | Time | Syntax Errors |
 | :-- | :-- | :-- | :-- |
@@ -167,6 +173,55 @@ streamlit run app.py
 | BERT | 12 | 18 min | 1 |
 | GPT-2 | 9 | 14 min | 0 |
 
+## Project Architecture
+```
+                               
+                           ┌───────────────────┐
+                           │   RAG Index       │
+                           └────────┬──────────┘
+                                    │
+                           ┌───────────────────┐
+                           │Angent (Analyst)   │
+                           │  (Paper Analysis) │
+                           └────────┬──────────┘
+                                    │
+                           ┌───────────────────┐
+                           │Angent (Architect) │
+                           │  (Project Plan)   │─────┐
+                           └────────┬──────────┘     |
+                                    │                | 
+                           ┌───────────────────┐     |
+                           │ Human-in-the-loop │     |
+                           │  Approve / Edit   │     |
+                           └───────┬───────────┘     |
+                                   │  Approved? No   |
+                  ┌────────────────┴─────────────────┘
+                  │                                  
+           Approved? Yes                       
+                  │                                                        
+          ┌─────────────┐ 
+          │Agent (Coder)│                  
+          │ Generate    │                  
+          │  Files      │                 
+          └─────┬───────┘                 
+                │                                 
+                └───────────┐                                   
+                   ┌─────────────────────────────┐
+                   │ Generate Project Folder /    │
+                   │ src/, requirements.txt,     │
+                   │ README.md, ZIP Export       │
+                   └─────────────────────────────┘
+
+```
+---
+
+## Contributing
+Contributions are very welcome. Good areas to work on:
+- Better prompts for specific domains (computer vision, reinforcement learning, graph networks)
+- Alternative RAG backends (Chroma, Pinecone, Weaviate)
+- Support for LaTeX source papers not on arXiv PDF
+- Training loop generation extend Coder to also produce train scripts
+- Unit tests for crew_runner.py post-processing functions
 
 ## License
 
@@ -179,5 +234,3 @@ MIT License  [LICENSE](LICENSE)
 - [Streamlit](https://streamlit.io) — amazing UI framework
 - Research community — for the papers that power this!
 ***
-
-
