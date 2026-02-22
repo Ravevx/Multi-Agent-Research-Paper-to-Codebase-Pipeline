@@ -1,0 +1,638 @@
+
+======================================================================
+[2026-02-22 20:59:02] AGENT: CODER_SRC_DATA_TOKENIZER.PY
+======================================================================
+import numpy as np
+import torch
+from typing import List, Tuple
+
+def generate_embeddings_with_pos_encoding(
+    token_ids: torch.Tensor,
+    embedding_dim: int = 512,
+    max_position_embedding: int = 10000
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generates embeddings with positional encoding using sinusoidal functions.
+    # Paper Eq.3: PE(pos, 2i) = sin(pos/10000^(2i/dmodel)), PE(pos, 2i+1) = cos(...)
+    """
+    batch_size, seq_len = token_ids.shape
+    embedding_matrix = torch.randn((embedding_dim, token_ids.max() + 1)) * (embedding_dim ** -0.5)
+
+    # Initialize positional encoding matrix
+    pos_encoding = torch.zeros(batch_size, seq_len, embedding_dim)
+    for b in range(batch_size):
+        for t in range(seq_len):
+            pos = torch.tensor(t, dtype=torch.float32)
+            for i in range(embedding_dim):
+                if i % 2 == 0:
+                    # Paper Eq.3: sin(pos/10000^(2i/dmodel))
+                    pos_encoding[b, t, i] = torch.sin(pos / (max_position_embedding ** (i / embedding_dim)))
+                else:
+                    # Paper Eq.3: cos(pos/10000^(2i+1)/dmodel)
+                    pos_encoding[b, t, i] = torch.cos(pos / (max_position_embedding ** ((i + 1) / embedding_dim)))
+
+    return token_ids @ embedding_matrix, pos_encoding
+
+def pad_sequence_to_max_len(
+    sequences: List[torch.Tensor],
+    max_length: int
+) -> torch.Tensor:
+    """
+    Pads sequences to maximum length in batch for attention computation.
+    """
+    padded = torch.zeros(len(sequences), max_length)
+    for i, seq in enumerate(sequences):
+        if len(seq) < max_length:
+            padded[i, :len(seq)] = seq
+    return padded
+
+--- EXTRA INFO ---
+Raw chars: 1687 | Cleaned lines: 43
+
+======================================================================
+[2026-02-22 20:59:42] AGENT: CODER_SRC_ATTENTION_MULTI_HEAD_ATTENTION.PY
+======================================================================
+import torch
+import math
+
+class MultiHeadAttention:
+    def __init__(self, d_model: int = 512, num_heads: int = 8):
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+
+        # Paper Eq. (1): Learnable projection matrices for queries, keys, values
+        self.W_q = torch.nn.Linear(d_model, d_model)
+        self.W_k = torch.nn.Linear(d_model, d_model)
+        self.W_v = torch.nn.Linear(d_model, d_model)
+
+        # Scaled dot-product attention weights
+        self.scaled_attention_weights = None
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = query.shape
+
+        # Paper Eq. (2): Project inputs through learned linear transformations
+        Q = self.W_q(query).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        K = self.W_k(key).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        V = self.W_v(value).view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        # Paper Eq. (3): Compute scaled dot-product attention
+        Q = Q.permute(0, 2, 1, 3)  # (batch_size, num_heads, seq_len, head_dim)
+        K = K.permute(0, 2, 1, 3)
+
+        # Scaled by sqrt(head_dim) as per paper Eq. (5)
+        scaled_attention_weights = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Paper Eq. (4): Apply softmax to normalize attention weights
+        self.scaled_attention_weights = torch.nn.functional.softmax(scaled_attention_weights, dim=-1)
+
+        # Multiply attention weights with value vectors
+        output = torch.matmul(self.scaled_attention_weights, V.permute(0, 2, 1, 3))
+        output = output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, -1)
+
+        return output
+
+--- EXTRA INFO ---
+Raw chars: 1810 | Cleaned lines: 40
+
+======================================================================
+[2026-02-22 21:00:10] AGENT: CODER_SRC_ATTENTION_SCALED_DOT_PRODUCT_ATTENTION.PY
+======================================================================
+import torch
+import numpy as np
+
+def compute_scaled_dot_product_attention(
+    queries: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    mask: torch.Tensor = None
+) -> torch.Tensor:
+    """
+    Computes scaled dot-product attention as described in the paper (Eq. 1).
+
+    Args:
+        queries: Shape (batch_size, heads, seq_len_q, embed_dim)
+        keys: Shape (batch_size, heads, seq_len_k, embed_dim)
+        values: Shape (batch_size, heads, seq_len_v, embed_dim)
+        mask: Optional masking tensor for illegal connections
+
+    Returns:
+        Attention output with shape (batch_size, heads, seq_len_q, seq_len_v)
+    """
+    # Step 1: Compute raw dot-product between queries and keys
+    dk = queries.shape[-1]
+    scaled_dot_product = torch.matmul(queries, keys.transpose(-2, -1)) / torch.sqrt(torch.tensor(dk, dtype=torch.float32))
+
+    # Step 2: Apply masking if provided (setting illegal connections to -∞)
+    if mask is not None:
+        scaled_dot_product.masked_fill_(mask == 0, float('-inf'))
+
+    # Step 3: Apply softmax along sequence dimension for each head
+    attention_weights = torch.softmax(scaled_dot_product, dim=-1)
+
+    # Compute weighted sum of values
+    output = torch.matmul(attention_weights, values)
+    return output
+
+--- EXTRA INFO ---
+Raw chars: 1287 | Cleaned lines: 35
+
+======================================================================
+[2026-02-22 21:00:50] AGENT: CODER_SRC_LAYERS_FEED_FORWARD.PY
+======================================================================
+import torch
+import torch.nn as nn
+from typing import Tuple
+
+class positionwise_feed_forward(nn.Module):
+    def __init__(self, dmodel: int = 512, df: int = 2048) -> None:
+        super().__init__()
+        self.W1 = nn.Linear(dmodel, df)
+        self.b1 = nn.Parameter(torch.zeros(df))
+        self.W2 = nn.Linear(df, dmodel)
+        self.b2 = nn.Parameter(torch.zeros(dmodel))
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor]:
+        # Paper Eq. 2: FFN(x) = max(0, xW1 + b1)W2 + b2
+        x_proj = self.W1(x)
+        relu_output = torch.relu(x_proj + self.b1)
+        output = self.W2(relu_output) + self.b2
+        return output
+
+def positionwise_feed_forward(
+    input_tensor: torch.Tensor,
+    dmodel: int = 512,
+    df: int = 2048
+) -> torch.Tensor:
+    """Applies two-layer MLP with ReLU activation to input tensor.
+
+    Args:
+        input_tensor: (batch_size, seq_len, embed_dim)
+        dmodel: Input/output dimension (dmodel = 512 per paper)
+        df: Inner layer dimension (df = 2048 per paper)
+
+    Returns:
+        Output of FFN(x) as described in Eq. 2
+    """
+    W1 = torch.nn.Linear(dmodel, df)
+    b1 = torch.zeros(df)
+    W2 = torch.nn.Linear(df, dmodel)
+    b2 = torch.zeros(dmodel)
+
+    x_proj = W1(input_tensor)
+    relu_output = torch.relu(x_proj + b1)
+    output = W2(relu_output) + b2
+    return output
+
+--- EXTRA INFO ---
+Raw chars: 1361 | Cleaned lines: 43
+
+======================================================================
+[2026-02-22 21:01:45] AGENT: CODER_SRC_LAYERS_SELF_ATTENTION_LAYER.PY
+======================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SelfAttentionLayer(nn.Module):
+    def __init__(self, dmodel: int = 512, nhead: int = 8, dropout: float = 0.1):
+        super(SelfAttentionLayer, self).__init__()
+        self.dmodel = dmodel
+        self.nhead = nhead
+
+        # Linear transformations for Q, K, V (Paper Eq. 3)
+        self.W_q = nn.Linear(dmodel, dmodel)
+        self.W_k = nn.Linear(dmodel, dmodel)
+        self.W_v = nn.Linear(dmodel, dmodel)
+
+        # Output projection
+        self.W_o = nn.Linear(dmodel, dmodel)
+
+        # Layer normalization and dropout
+        self.layer_norm = nn.LayerNorm(dmodel)
+        self.dropout = nn.Dropout(dropout)
+
+    def scaled_dot_product_attention(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        """Compute scaled dot-product attention (Paper Eq. 3)."""
+        d_k = Q.size(-1)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
+        attn_weights = F.softmax(scores, dim=-1)
+        return torch.matmul(attn_weights, V)
+
+    def multi_head_attention(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        """Split into multiple heads and concatenate results (Paper Eq. 3)."""
+        batch_size = Q.size(0)
+        head_dim = self.dmodel // self.nhead
+
+        # Project to different heads
+        Q_heads = Q.view(batch_size, -1, self.nhead, head_dim).transpose(1, 2)
+        K_heads = K.view(batch_size, -1, self.nhead, head_dim).transpose(1, 2)
+        V_heads = V.view(batch_size, -1, self.nhead, head_dim).transpose(1, 2)
+
+        # Compute attention for each head
+        attn_output_heads = [
+            self.scaled_dot_product_attention(Q_h, K_h, V_h)
+            for Q_h, K_h, V_h in zip(Q_heads, K_heads, V_heads)
+        ]
+
+        # Concatenate heads and project back
+        concat_heads = torch.cat(attn_output_heads, dim=2).transpose(1, 2).contiguous()
+        return self.W_o(concat_heads)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Complete self-attention layer with residual connection and normalization."""
+        # Step 1: Linear transformations for Q, K, V (Paper Eq. 3)
+        Q = self.W_q(x)
+        K = self.W_k(x)
+        V = self.W_v(x)
+
+        # Step 2: Multi-head attention
+        attn_output = self.multi_head_attention(Q, K, V)
+
+        # Step 3: Residual connection (add original input)
+        residual = x
+        out = attn_output + residual
+
+        # Step 4: Layer normalization
+        out = self.layer_norm(out)
+
+        return out
+
+--- EXTRA INFO ---
+Raw chars: 2583 | Cleaned lines: 67
+
+======================================================================
+[2026-02-22 21:02:43] AGENT: CODER_SRC_LAYERS_CROSS_ATTENTION_LAYER.PY
+======================================================================
+import torch
+import torch.nn as nn
+from typing import Tuple
+
+class CrossAttentionLayer(nn.Module):
+    def __init__(self,
+                 d_model: int = 512,
+                 n_heads: int = 8,
+                 df_ff: int = 2048) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        # Paper Eq. (1): Scaled Dot-Product Attention
+        self.query_layer = nn.Linear(d_model, d_model)
+        self.key_layer = nn.Linear(d_model, d_model)
+        self.value_layer = nn.Linear(d_model, d_model)
+
+        self.attention_weights = nn.Parameter(torch.zeros(1, n_heads, 1, 1))
+        self.output_layer = nn.Linear(d_model, d_model)
+
+        # Feed-forward network for multi-head attention
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, df_ff),
+            nn.ReLU(),
+            nn.Linear(df_ff, d_model)
+        )
+
+    def scaled_dot_product_attention(self,
+                                    queries: torch.Tensor,
+                                    keys: torch.Tensor,
+                                    values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Paper Eq. (1): Scaled Dot-Product Attention
+        d_k = self.head_dim
+        scores = torch.matmul(queries, keys.transpose(-2, -1)) / torch.sqrt(torch.tensor(d_k))
+        attention_weights = torch.softmax(scores, dim=-1)
+        output = torch.matmul(attention_weights, values)
+        return output, attention_weights
+
+    def multi_head_attention(self,
+                           queries: torch.Tensor,
+                           keys: torch.Tensor,
+                           values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = queries.size(0)
+
+        # Linear projections for each head
+        q = self.query_layer(queries).view(batch_size, -1, self.n_heads, self.head_dim)
+        k = self.key_layer(keys).view(batch_size, -1, self.n_heads, self.head_dim)
+        v = self.value_layer(values).view(batch_size, -1, self.n_heads, self.head_dim)
+
+        # Transpose for matmul
+        q = q.transpose(2, 3)
+        k = k.transpose(2, 3)
+        v = v.transpose(2, 3)
+
+        output, attention_weights = self.scaled_dot_product_attention(q, k, v)
+        output = output.transpose(2, 3).contiguous().view(batch_size, -1, self.d_model)
+
+        return output, attention_weights
+
+    def forward(self,
+               decoder_queries: torch.Tensor,
+               encoder_keys: torch.Tensor,
+               encoder_values: torch.Tensor) -> torch.Tensor:
+        # Step 1: Compute scaled dot-product attention between decoder queries and encoder keys/values
+        transformed_output, _ = self.multi_head_attention(decoder_queries, encoder_keys, encoder_values)
+
+        # Step 2: Apply multi-head attention on top of that (implicitly handled in forward pass)
+        residual = decoder_queries
+
+        # Step 3: Add residual connection to original input
+        transformed_output += residual
+
+        # Step 4: Apply layer normalization
+        output = nn.LayerNorm(self.d_model)(transformed_output)
+
+        return output
+
+--- EXTRA INFO ---
+Raw chars: 3163 | Cleaned lines: 78
+
+======================================================================
+[2026-02-22 21:03:23] AGENT: CODER_SRC_MODELS_ENCODER.PY
+======================================================================
+import torch
+import torch.nn as nn
+import math
+
+class EncoderLayer(nn.Module):
+    def __init__(self, dmodel: int = 512, df_ffn: int = 2048) -> None:
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model=dmodel, num_heads=8)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(dmodel, df_ffn),
+            nn.ReLU(),
+            nn.Linear(df_ffn, dmodel)
+        )
+        self.norm1 = nn.LayerNorm(dmodel)
+        self.norm2 = nn.LayerNorm(dmodel)
+        self.dropout = nn.Dropout(p=0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Self-attention with residual connection and layer normalization (Paper Eq. 2)
+        attn_output, _ = self.self_attn(
+            query=x,
+            key=x,
+            value=x,
+            need_weights=False
+        )
+        x = self.norm1(x + self.dropout(attn_output))  # Residual connection
+
+        # Feed-forward network with residual connection and layer normalization (Paper Eq. 2)
+        ff_output = self.feed_forward(x)
+        x = self.norm2(x + self.dropout(ff_output))
+        return x
+
+class EncoderStack(nn.Module):
+    def __init__(self, dmodel: int = 512, df_ffn: int = 2048, n_layers: int = 6) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([EncoderLayer(dmodel=dmodel, df_ffn=df_ffn)
+                                    for _ in range(n_layers)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Process entire input sequence through all encoder layers in parallel
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+--- EXTRA INFO ---
+Raw chars: 1618 | Cleaned lines: 43
+
+======================================================================
+[2026-02-22 21:04:17] AGENT: CODER_SRC_MODELS_DECODER.PY
+======================================================================
+import torch
+import torch.nn as nn
+from typing import Optional
+
+class DecoderLayer(nn.Module):
+    def __init__(self,
+                 d_model: int = 512,
+                 df_ffn: int = 2048,
+                 dropout: float = 0.1) -> None:
+        super().__init__()
+        self.self_attention = nn.MultiheadAttention(d_model, num_heads=8)
+        self.cross_attention = nn.MultiheadAttention(d_model, num_heads=8)
+        self.ffn_layer1 = nn.Linear(d_model, df_ffn)
+        self.ffn_layer2 = nn.Linear(df_ffn, d_model)
+        self.norm1_self = nn.LayerNorm(d_model)
+        self.norm1_cross = nn.LayerNorm(d_model)
+        self.norm2_ffn = nn.LayerNorm(d_model)
+
+    def forward(self,
+                x: torch.Tensor,
+                encoder_outputs: Optional[torch.Tensor] = None,
+                memory_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Self-attention with masking (Paper Eq. 3)
+        self_attn_output, _ = self.self_attention(
+            x,
+            x,
+            x,
+            need_weights=False
+        )
+        self_attn_output = self.norm1_self(x + self_attn_output)
+
+        # Cross-attention to encoder outputs
+        cross_attn_output, _ = self.cross_attention(
+            self_attn_output,
+            encoder_outputs,
+            encoder_outputs,
+            need_weights=False
+        )
+        cross_attn_output = self.norm1_cross(cross_attn_output + self_attn_output)
+
+        # Feed-forward network (Paper Eq. 2)
+        ffn_input = self.ffn_layer1(cross_attn_output)
+        ffn_output = torch.relu(ffn_input)
+        ffn_output = self.ffn_layer2(ffn_output)
+        ffn_output = self.norm2_ffn(cross_attn_output + ffn_output)
+
+        return ffn_output
+
+class DecoderStack(nn.Module):
+    def __init__(self,
+                 d_model: int = 512,
+                 df_ffn: int = 2048,
+                 num_layers: int = 6,
+                 dropout: float = 0.1) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, df_ffn, dropout)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self,
+                x: torch.Tensor,
+                encoder_outputs: Optional[torch.Tensor] = None) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, encoder_outputs)
+        return x
+
+--- EXTRA INFO ---
+Raw chars: 2340 | Cleaned lines: 66
+
+======================================================================
+[2026-02-22 21:05:35] AGENT: CODER_SRC_MODELS_TRANSFORMER.PY
+======================================================================
+import torch
+import torch.nn as nn
+from typing import Tuple
+
+class LayerNorm(nn.Module):
+    def __init__(self, d_model: int = 512) -> None:
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * self.gamma + self.beta
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int = 512, max_len: int = 5000) -> None:
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:x.size(1)]
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model: int = 512, num_heads: int = 8, dropout: float = 0.1) -> None:
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_k = d_model // num_heads
+        self.h = num_heads
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def scaled_dot_product_attention(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        attn_probs = self.dropout(torch.softmax(attn_scores, dim=-1))
+        output = torch.matmul(attn_probs, V)
+        return output, attn_probs
+
+    def split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, d_model = x.size()
+        return x.view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)
+
+    def combine_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, _, seq_len, d_k = x.size()
+        return x.transpose(1, 2).contiguous().view(batch_size, seq_len, self.h * d_k)
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        Q = self.split_heads(self.W_q(Q))
+        K = self.split_heads(self.W_k(K))
+        V = self.split_heads(self.W_v(V))
+
+        output, attn_weights = self.scaled_dot_product_attention(Q, K, V)
+        output = self.combine_heads(output)
+        return self.W_o(output), attn_weights
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model: int = 512, df_ff: int = 2048) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, df_ff)
+        self.fc2 = nn.Linear(df_ff, d_model)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.dropout(torch.relu(self.fc1(x))))
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model: int = 512, num_heads: int = 8, df_ff: int = 2048) -> None:
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, num_heads)
+        self.feed_forward = FeedForward(d_model, df_ff)
+        self.norm1 = LayerNorm(d_model)
+        self.norm2 = LayerNorm(d_model)
+
+--- EXTRA INFO ---
+Raw chars: 3486 | Cleaned lines: 82
+
+======================================================================
+[2026-02-22 21:06:28] AGENT: CODER_SRC_MAIN.PY
+======================================================================
+import torch
+from torch.nn import Linear
+from transformers import TransformerModel, TransformerEncoderLayer, TransformerDecoderLayer
+
+def main():
+    # Step 2: Define config dict with all hyperparameters from the paper
+    config = {
+        "dmodel": 512,
+        "df": 2,
+        "N": 6,
+        "vocab_size": 30522,  # Example placeholder; adjust based on actual tokenizer
+        "max_seq_len": 100,
+        "batch_size": 4,
+    }
+
+    # Step 3: Instantiate the model using config values
+    class PositionalEncoding(torch.nn.Module):
+        def __init__(self, dmodel, max_len=5000):
+            super().__init__()
+            pe = torch.zeros(max_len, dmodel)
+            position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, dmodel, 2) * -(math.log(10000.0) / dmodel))
+            pe[:, 0::2] = torch.sin(position * div_term)
+            pe[:, 1::2] = torch.cos(position * div_term)
+            self.register_buffer("pe", pe)
+
+        def forward(self, x):
+            return x + self.pe[:x.size(1)]
+
+    import math
+    positional_encoder = PositionalEncoding(config["dmodel"], config["max_seq_len"])
+
+    # Create encoder and decoder stacks (N=6 layers)
+    encoder_layers = TransformerEncoderLayer(d_model=config["dmodel"], nhead=8, dim_feedforward=2*config["dmodel"])
+    decoder_layers = TransformerDecoderLayer(d_model=config["dmodel"], nhead=8, dim_feedforward=2*config["dmodel"])
+
+    encoder_stack = torch.nn.ModuleList([encoder_layers] * config["N"])
+    decoder_stack = torch.nn.ModuleList([decoder_layers] * config["N"])
+
+    model = TransformerModel(
+        d_model=config["dmodel"],
+        nhead=8,
+        num_encoder_layers=config["N"],
+        dim_feedforward=2*config["dmodel"]
+    )
+
+    # Step 4: Generate sample input tensors matching the paper's expected dimensions
+    # Input embeddings (batch_size, seq_len, dmodel)
+    input_embeddings = torch.randn(config["batch_size"], config["max_seq_len"], config["dmodel"])
+
+    # Apply positional encoding
+    input_with_pos = positional_encoder(input_embeddings)
+
+    # Step 5: Run the model forward pass
+    outputs = model(
+        src=input_with_pos,
+        src_mask=None,
+        memory_key_padding_mask=None,
+        memory_attn_mask=None,
+        memory_key_padding_mask=None,
+        memory_value_padding_mask=None,
+        memory_attn_mask=None,
+        memory_key_padding_mask=None,
+        memory_value_padding_mask=None
+    )
+
+    # Step 6: Print output shape to verify correctness
+    print("Output shape:", outputs.last_hidden_state.shape)
+
+if __name__ == "__main__":
+    main()
+
+--- EXTRA INFO ---
+Raw chars: 2645 | Cleaned lines: 71
